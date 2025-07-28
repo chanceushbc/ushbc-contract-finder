@@ -1,0 +1,223 @@
+const SAM_API_KEY = "ZfsYKIXSjIkYdbWRfYeGRvjnvO1qE90InA4cWtBC"; // <- Replace this
+
+async function fetchSAMGov() {
+  const url = new URL("https://api.sam.gov/opportunities/v2/search");
+  url.search = new URLSearchParams({
+    api_key: SAM_API_KEY,
+    limit: 25,
+    postedFrom: "2024-01-01",
+    sort: "date"
+  });
+
+  const res = await fetch(url.toString());
+  const json = await res.json();
+
+  return (json.opportunities || []).map(op => ({
+    title: op.title,
+    agency: op.agencyName || "N/A",
+    requestType: op.type || "Solicitation",
+    industry: op.naics || "N/A",
+    dateOpened: op.publishDate?.split("T")[0],
+    dueDate: op.responseDeadline?.split("T")[0],
+    location: op.placeOfPerformance?.city || "N/A",
+    link: `https://sam.gov/opp/${op.noticeId}/view`,
+    source: "samgov"
+  }));
+}
+
+async function fetchUSASpending() {
+  const res = await fetch("https://api.usaspending.gov/api/v2/search/spending_by_award/?limit=25");
+  const json = await res.json();
+
+  return (json?.results || []).map(item => ({
+    title: item.award?.description || "Award",
+    agency: item.award?.awarding_agency?.name || "N/A",
+    requestType: "Award",
+    industry: item.award?.naics_description || "N/A",
+    dateOpened: item.award?.date_signed || "",
+    dueDate: "",
+    location: item.award?.place_of_performance?.city_name || "N/A",
+    link: "#",
+    source: "usaspending"
+  }));
+}
+
+async function fetchFEMA() {
+  const res = await fetch("https://www.fema.gov/api/open/v2/DisasterDeclarationsSummaries?$top=25");
+  const json = await res.json();
+
+  return (json?.DisasterDeclarationsSummaries || []).map(item => ({
+    title: `Disaster: ${item.disasterType} - ${item.incidentType}`,
+    agency: "FEMA",
+    requestType: "Disaster",
+    industry: item.incidentType || "N/A",
+    dateOpened: item.declarationDate?.split("T")[0],
+    dueDate: "",
+    location: item.designatedArea || "N/A",
+    link: `https://www.fema.gov/disaster/${item.disasterNumber}`,
+    source: "fema"
+  }));
+}
+
+async function fetchGrants() {
+  const res = await fetch("https://www.grants.gov/grantsws/rest/opportunities/search?startRecordNum=0&oppStatuses=forecasted&rows=25");
+  const xml = await res.text();
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xml, "text/xml");
+
+  return [...doc.querySelectorAll("opportunity")].map(el => ({
+    title: el.querySelector("title")?.textContent || "Grant",
+    agency: el.querySelector("agencyName")?.textContent || "N/A",
+    requestType: "Grant",
+    industry: el.querySelector("fundingOppCategory")?.textContent || "N/A",
+    dateOpened: el.querySelector("postDate")?.textContent,
+    dueDate: el.querySelector("closeDate")?.textContent,
+    location: "N/A",
+    link: el.querySelector("synopsisURL")?.textContent || "#",
+    source: "grants"
+  }));
+}
+
+async function loadUnifiedContracts() {
+  const results = await Promise.allSettled([
+    fetchSAMGov(),
+    fetchUSASpending(),
+    fetchFEMA(),
+    fetchGrants()
+  ]);
+
+  const all = results
+    .filter(r => r.status === "fulfilled")
+    .flatMap(r => r.value)
+    .filter(Boolean);
+
+  renderWidget(all);
+}
+
+function renderWidget(data) {
+  const container = document.getElementById("contract-widget");
+  container.innerHTML = `
+    <style>
+      #contract-widget {
+        font-family: 'Helvetica Neue', sans-serif;
+        background: #fff;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 0 10px rgba(0,0,0,0.05);
+        overflow-x: auto;
+      }
+      .filters { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+      input, select {
+        padding: 8px;
+        border-radius: 6px;
+        border: 1px solid #ccc;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+      }
+      th, td {
+        text-align: left;
+        padding: 12px;
+        border-bottom: 1px solid #eee;
+      }
+      th {
+        background-color: #f4f9ff;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      tr:hover { background: #f8fbff; }
+      a { color: #004990; text-decoration: none; }
+    </style>
+    <div class="filters">
+      <input type="search" id="search" placeholder="Search title..." />
+      <select id="source"><option value="">Source</option></select>
+      <select id="requestType"><option value="">Type</option></select>
+      <select id="agency"><option value="">Agency</option></select>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th data-key="title">Title</th>
+          <th data-key="agency">Agency</th>
+          <th data-key="requestType">Type</th>
+          <th data-key="industry">Industry</th>
+          <th data-key="dateOpened">Opened</th>
+          <th data-key="dueDate">Due</th>
+          <th data-key="source">Source</th>
+        </tr>
+      </thead>
+      <tbody id="results"></tbody>
+    </table>
+  `;
+
+  const state = { data, filtered: data.slice(), sortKey: "", sortAsc: true };
+
+  function filterAndSort() {
+    const search = document.getElementById("search").value.toLowerCase();
+    const type = document.getElementById("requestType").value;
+    const agency = document.getElementById("agency").value;
+    const source = document.getElementById("source").value;
+
+    state.filtered = state.data.filter(d =>
+      (!search || d.title.toLowerCase().includes(search)) &&
+      (!type || d.requestType === type) &&
+      (!agency || d.agency === agency) &&
+      (!source || d.source === source)
+    );
+
+    if (state.sortKey) {
+      state.filtered.sort((a, b) => {
+        const valA = a[state.sortKey]?.toString().toLowerCase() || "";
+        const valB = b[state.sortKey]?.toString().toLowerCase() || "";
+        return (valA > valB ? 1 : -1) * (state.sortAsc ? 1 : -1);
+      });
+    }
+
+    renderRows();
+  }
+
+  function renderRows() {
+    document.getElementById("results").innerHTML = state.filtered.map(d => `
+      <tr>
+        <td><a href="${d.link}" target="_blank">${d.title}</a></td>
+        <td>${d.agency}</td>
+        <td>${d.requestType}</td>
+        <td>${d.industry}</td>
+        <td>${d.dateOpened || "-"}</td>
+        <td>${d.dueDate || "-"}</td>
+        <td>${d.source}</td>
+      </tr>
+    `).join('');
+  }
+
+  function populateFilters(key) {
+    const sel = document.getElementById(key);
+    const values = [...new Set(state.data.map(d => d[key]).filter(Boolean))].sort();
+    values.forEach(v => sel.innerHTML += `<option value="${v}">${v}</option>`);
+  }
+
+  document.getElementById("search").addEventListener("input", filterAndSort);
+  ["source", "requestType", "agency"].forEach(id => {
+    document.getElementById(id).addEventListener("change", filterAndSort);
+    populateFilters(id);
+  });
+
+  document.querySelectorAll("th[data-key]").forEach(th => {
+    th.addEventListener("click", () => {
+      const key = th.dataset.key;
+      if (state.sortKey === key) {
+        state.sortAsc = !state.sortAsc;
+      } else {
+        state.sortKey = key;
+        state.sortAsc = true;
+      }
+      filterAndSort();
+    });
+  });
+
+  filterAndSort();
+}
+
+loadUnifiedContracts();
